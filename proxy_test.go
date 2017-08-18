@@ -16,6 +16,7 @@ package main
 
 import (
 	"encoding/json"
+	"io/ioutil"
 	"net"
 	"os"
 	"strings"
@@ -928,4 +929,94 @@ func TestGetSocketPath(t *testing.T) {
 	p, err = getSocketPath()
 	assert.NotNil(t, err, err)
 	assert.Equal(t, p, "")
+}
+
+func TestStoreRestore(t *testing.T) {
+	assert := assert.New(t)
+
+	// clean up a possible state
+	os.RemoveAll(storeStateDir)
+
+	rig := newTestRig(t)
+	rig.Start()
+
+	assert.False(rig.proxy.restoreState())
+
+	rig.RegisterVM()
+	rig.Stop()
+	// the state expected to be present on a disk
+	files, err := ioutil.ReadDir(storeStateDir)
+	assert.Nil(err)
+	assert.Equal(len(files), 2)
+	assert.Equal(files[0].Name(), "proxy_state.json")
+	assert.Equal(files[1].Name(), "vm_"+testContainerID+".json")
+
+	rig.Start()
+	assert.Equal(rig.proxy.restoreState(), true)
+	assert.Nil(rig.Client.UnregisterVM(testContainerID))
+	// the state must be absent on the disk
+	files, err = ioutil.ReadDir(storeStateDir)
+	assert.Nil(err)
+	assert.Equal(len(files), 0)
+	os.RemoveAll(storeStateDir)
+}
+
+func TestStoreRestoreInvalidState(t *testing.T) {
+	assert := assert.New(t)
+	proxyStateFilePath := storeStateDir + "proxy_state.json"
+	rig := newTestRig(t)
+	rig.Start()
+
+	// clean up a possible state
+	os.RemoveAll(storeStateDir)
+	assert.Nil(os.MkdirAll(storeStateDir, 0750))
+
+	// restore from an inaccessible file (permission denied)
+	assert.Nil(ioutil.WriteFile(proxyStateFilePath, []byte{' '}, 0000))
+	assert.False(rig.proxy.restoreState())
+	assert.Nil(os.Remove(proxyStateFilePath))
+
+	// restore from an empty file
+	assert.Nil(ioutil.WriteFile(proxyStateFilePath, []byte(""), 0600))
+	assert.False(rig.proxy.restoreState())
+
+	// restore from garbage
+	assert.Nil(ioutil.WriteFile(proxyStateFilePath, []byte("Hello, World!"), 0600))
+	assert.False(rig.proxy.restoreState())
+
+	// ContainerIDs list is empty
+	const s = `{ "container_ids": [ ] }`
+	assert.Nil(ioutil.WriteFile(proxyStateFilePath, []byte(s), 0600))
+	assert.False(rig.proxy.restoreState())
+
+	// Version is wrong
+	const sVer = `{ "version": "-1", "container_ids": [ "0987654321" ] }`
+	assert.Nil(ioutil.WriteFile(proxyStateFilePath, []byte(sVer), 0600))
+	assert.False(rig.proxy.restoreState())
+	assert.Nil(os.Remove(proxyStateFilePath))
+
+	// wrong parameters
+	restoreVMState(nil, "")
+	assert.Nil(readVMState(""))
+
+	vmStateFile := storeStateDir + "vm_" + testContainerID + ".json"
+	// restore from an inaccessible file (no such file or directory)
+	assert.Nil(readVMState(testContainerID))
+
+	// restore from garbage
+	assert.Nil(ioutil.WriteFile(vmStateFile, []byte("Garbage"), 0600))
+	assert.Nil(readVMState(testContainerID))
+	assert.Nil(os.Remove(vmStateFile))
+
+	// ContainerID is empty
+	const sVM = `{ "registerVM": { "containerId": "" } } `
+	assert.Nil(ioutil.WriteFile(vmStateFile, []byte(sVM), 0600))
+	restoreVMState(rig.proxy, testContainerID)
+
+	// vm == nil
+	restoreTokens(rig.proxy, &vmStateOnDisk{}, nil)
+	// ignores empty list of tokens
+	restoreTokens(rig.proxy, &vmStateOnDisk{api.RegisterVM{}, []string{}}, &vm{})
+
+	os.RemoveAll(storeStateDir)
 }
