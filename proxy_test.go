@@ -16,6 +16,7 @@ package main
 
 import (
 	"encoding/json"
+	"io/ioutil"
 	"net"
 	"os"
 	"strings"
@@ -928,4 +929,30 @@ func TestGetSocketPath(t *testing.T) {
 	p, err = getSocketPath()
 	assert.NotNil(t, err, err)
 	assert.Equal(t, p, "")
+}
+
+func TestStoreRestore(t *testing.T) {
+	storeStateDir = "/tmp/clearcontainers/proxy/"
+	rig := newTestRig(t)
+	rig.Start()
+
+	// clean up a possible state
+	os.RemoveAll(storeStateDir)
+	assert.Equal(t, rig.proxy.restoreState(), false)
+
+	rig.RegisterVM()
+	rig.Stop()
+	// the state must be present on the disk
+	files, err := ioutil.ReadDir(storeStateDir)
+	assert.Nil(t, err)
+	assert.Equal(t, len(files), 2)
+	assert.Equal(t, files[0].Name(), "proxy_state.json")
+
+	rig.Start()
+	assert.Equal(t, rig.proxy.restoreState(), true)
+	assert.Nil(t, rig.Client.UnregisterVM(testContainerID))
+	// the state must be absent on the disk
+	files, err = ioutil.ReadDir(storeStateDir)
+	assert.Nil(t, err)
+	assert.Equal(t, len(files), 0)
 }

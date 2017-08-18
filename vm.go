@@ -285,6 +285,10 @@ func (vm *vm) consoleToLog() {
 }
 
 func (vm *vm) Connect() error {
+	return vm.Reconnect(false)
+}
+
+func (vm *vm) Reconnect(reconnect bool) error {
 	if vm.console.socketPath != "" {
 		var err error
 
@@ -301,7 +305,12 @@ func (vm *vm) Connect() error {
 		return err
 	}
 
-	if err := vm.hyperHandler.WaitForReady(); err != nil {
+	if reconnect {
+		if !vm.hyperHandler.IsStarted() {
+			vm.hyperHandler.CloseSockets()
+			return errors.New("failed to reconnect to the agent")
+		}
+	} else if err := vm.hyperHandler.WaitForReady(); err != nil {
 		vm.hyperHandler.CloseSockets()
 		return err
 	}
@@ -601,6 +610,11 @@ func (session *ioSession) SendSignal(signal syscall.Signal) error {
 }
 
 func (vm *vm) AllocateToken() (Token, error) {
+	return vm.AllocateTokenAs("")
+}
+
+// if token == "" then a new token is generate, otherwise provided token is reused
+func (vm *vm) AllocateTokenAs(token Token) (Token, error) {
 	vm.Lock()
 	defer vm.Unlock()
 
@@ -610,9 +624,12 @@ func (vm *vm) AllocateToken() (Token, error) {
 	ioBase := vm.nextIoBase
 	vm.nextIoBase += uint64(nStreams)
 
-	token, err := GenerateToken(32)
-	if err != nil {
-		return nilToken, err
+	if token == "" {
+		var err error
+		token, err = GenerateToken(32)
+		if err != nil {
+			return nilToken, err
+		}
 	}
 
 	session := &ioSession{

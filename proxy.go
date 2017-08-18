@@ -20,6 +20,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"net"
 	"net/http"
 	_ "net/http/pprof"
@@ -129,6 +130,33 @@ func newClient(proxy *proxy, conn net.Conn) *client {
 	}
 }
 
+func (proxy *proxy) restoreTokens(vm *vm, tokens []string) error {
+	if len(tokens) == 0 {
+		return nil
+	}
+
+	for _, token := range tokens {
+		token, err := vm.AllocateTokenAs(Token(token))
+		if err != nil {
+			return err
+		}
+		proxy.Lock()
+		proxy.tokenToVM[token] = &tokenInfo{
+			state: tokenStateAllocated,
+			vm:    vm,
+		}
+		proxy.Unlock()
+
+		session := vm.findSessionByToken(token)
+		if session == nil {
+			return fmt.Errorf("unknown token %s", token)
+		}
+		// Signal that the process is already started
+		close(session.processStarted)
+	}
+	return nil
+}
+
 func (proxy *proxy) allocateTokens(vm *vm, numIOStreams int) (*api.IOResponse, error) {
 	url := url.URL{
 		Scheme: "unix",
@@ -193,6 +221,207 @@ func (proxy *proxy) releaseToken(token Token) (*tokenInfo, error) {
 	return info, nil
 }
 
+var storeStateDir = "/var/lib/clear-containers/proxy/"
+
+type proxyStateOnDisk struct {
+	SocketPath      string   `json:"socket_path"`
+	EnableVMConsole bool     `json:"enable_vm_console"`
+	ContainerIDs    []string `json:"container_ids"`
+}
+
+// returns false if it's a clean start (i.e. no state is stored) or restoring failed
+func (proxy *proxy) restoreState() bool {
+	proxyStateFilePath := storeStateDir + "proxy_state.json"
+	if _, err := os.Stat(storeStateDir); os.IsNotExist(err) {
+		if err := os.MkdirAll(storeStateDir, 0755); err != nil {
+			proxyLog.Errorf("Couldn't create directory %s: %v",
+				storeStateDir, err)
+		}
+		return false
+	}
+	if _, err := os.Stat(proxyStateFilePath); os.IsNotExist(err) {
+		return false
+	}
+
+	fdata, err := ioutil.ReadFile(proxyStateFilePath)
+	if err != nil {
+		proxyLog.Errorf("Couldn't recover from %s: %v", proxyStateFilePath, err)
+		return false
+	}
+
+	var proxyState proxyStateOnDisk
+	err = json.Unmarshal(fdata, &proxyState)
+	if err != nil {
+		proxyLog.Errorf("Couldn't unmarshal %s: %v", proxyStateFilePath, err)
+		return false
+	}
+	proxyLog.Debugf("proxy: %+v", proxyState)
+
+	if len(proxyState.ContainerIDs) == 0 {
+		return false
+	}
+	proxyLog.Warn("Recovering proxy state from: ", proxyStateFilePath)
+	proxy.socketPath = proxyState.SocketPath
+	proxy.enableVMConsole = proxyState.EnableVMConsole
+
+	for _, contID := range proxyState.ContainerIDs {
+		go restoreVMState(proxy, contID)
+	}
+
+	return true
+}
+
+func (proxy *proxy) storeState() {
+	proxyStateFilePath := storeStateDir + "proxy_state.json"
+	proxy.Lock()
+	defer proxy.Unlock()
+
+	// if there are 0 VMs then remove state from disk
+	if (len(proxy.vms)) == 0 {
+		if err := os.Remove(proxyStateFilePath); err != nil {
+			proxyLog.Errorf("Can not remove %s: %v", proxyStateFilePath, err)
+		}
+		return
+	}
+
+	proxyState := &proxyStateOnDisk{
+		SocketPath:      proxy.socketPath,
+		EnableVMConsole: proxy.enableVMConsole,
+		ContainerIDs:    make([]string, 0, len(proxy.vms)),
+	}
+	for cid := range proxy.vms {
+		proxyState.ContainerIDs = append(proxyState.ContainerIDs, cid)
+	}
+
+	data, err := json.MarshalIndent(proxyState, "", "\t")
+	if err != nil {
+		proxyLog.Errorf("Couldn't marshal proxy state %+v", proxyState)
+	}
+	if err = ioutil.WriteFile(proxyStateFilePath, data, 0644); err != nil {
+		proxyLog.Errorf("Couldn't store proxy state to %s: %v",
+			proxyStateFilePath, err)
+	}
+}
+
+// Represents vm struct on disk
+type vmStateOnDisk struct {
+	RegisterVM api.RegisterVM `json:"registerVM"`
+	Tokens     []string       `json:"tokens"`
+}
+
+func vmStateFilePath(id string) string {
+	return storeStateDir + "vm_" + id + ".json"
+}
+
+func storeVMState(vm *vm, tokens []string) {
+	odVM := vmStateOnDisk{
+		RegisterVM: api.RegisterVM{
+			ContainerID: vm.containerID,
+			CtlSerial:   vm.hyperHandler.GetCtlSockPath(),
+			IoSerial:    vm.hyperHandler.GetIoSockPath(),
+			Console:     vm.console.socketPath,
+		},
+		Tokens: tokens,
+	}
+	o, err := json.MarshalIndent(&odVM, "", "\t")
+	if err != nil {
+		proxyLog.WithField("vm", vm.containerID).Warn("Couldn't marshal VM state")
+	}
+	storeFile := vmStateFilePath(vm.containerID)
+	if err = ioutil.WriteFile(storeFile, o, 0644); err != nil {
+		proxyLog.WithField("vm", vm.containerID).Warn("Couldn't store VM state to ",
+			storeFile)
+	}
+}
+
+func delVMAndState(proxy *proxy, vm *vm) {
+	proxyLog.Infof("Removing on-disk state of %s", vm.containerID)
+	proxy.Lock()
+	delete(proxy.vms, vm.containerID)
+	proxy.Unlock()
+	proxy.storeState()
+	storeFile := vmStateFilePath(vm.containerID)
+	if err := os.Remove(storeFile); err != nil {
+		proxyLog.WithField("vm", vm.containerID).Warn("Couldn't remove file ",
+			storeFile)
+	}
+}
+
+func restoreVMState(proxy *proxy, containerID string) {
+	vmStateFilePath := vmStateFilePath(containerID)
+	proxy.Lock()
+	fdata, err := ioutil.ReadFile(vmStateFilePath)
+	proxy.Unlock()
+	if err != nil {
+		proxyLog.Errorf("Couldn't read %s: %v", vmStateFilePath, err)
+		return
+	}
+
+	var vmState vmStateOnDisk
+	err = json.Unmarshal(fdata, &vmState)
+	if err != nil {
+		proxyLog.Errorf("Can not unmarshal %s: %v", vmStateFilePath, err)
+		return
+	}
+	proxyLog.Debugf("restored vm state: %+v", vmState)
+
+	regVM := vmState.RegisterVM
+
+	if regVM.ContainerID == "" || regVM.CtlSerial == "" || regVM.IoSerial == "" {
+		proxyLog.Errorf("wrong VM parameters")
+		return
+	}
+
+	proxy.Lock()
+	if _, ok := proxy.vms[regVM.ContainerID]; ok {
+		proxy.Unlock()
+		proxyLog.Errorf("%s: container already registered", regVM.ContainerID)
+		return
+	}
+	vm := newVM(regVM.ContainerID, regVM.CtlSerial, regVM.IoSerial)
+	proxy.vms[regVM.ContainerID] = vm
+	proxy.Unlock()
+
+	proxyLog.Infof("restoreVMState(containerId=%s,ctlSerial=%s,ioSerial=%s,console=%s)",
+		regVM.ContainerID, regVM.CtlSerial, regVM.IoSerial, regVM.Console)
+
+	if regVM.Console != "" && proxy.enableVMConsole {
+		vm.setConsole(regVM.Console)
+	}
+
+	if err := proxy.restoreTokens(vm, vmState.Tokens); err != nil {
+		proxyLog.Errorf("Failed to restore tokens: %v", err)
+		return
+	}
+
+	for _, token := range vmState.Tokens {
+		session := vm.findSessionByToken(Token(token))
+		if session == nil {
+			proxyLog.Errorf("Session must be not nil")
+			delVMAndState(proxy, vm)
+			return
+		}
+		if err := session.WaitForShim(); err != nil {
+			proxyLog.Errorf("Failed to re-connect with shim: %v", err)
+			delVMAndState(proxy, vm)
+			return
+		}
+	}
+	if err := vm.Reconnect(true); err != nil {
+		proxyLog.Errorf("Failed to connect: %v", err)
+		delVMAndState(proxy, vm)
+		return
+	}
+
+	// We start one goroutine per-VM to monitor the qemu process
+	proxy.wg.Add(1)
+	go func() {
+		<-vm.OnVMLost()
+		vm.Close()
+		proxy.wg.Done()
+	}()
+}
+
 // "RegisterVM"
 func registerVM(data []byte, userData interface{}, response *handlerResponse) {
 	client := userData.(*client)
@@ -247,6 +476,8 @@ func registerVM(data []byte, userData interface{}, response *handlerResponse) {
 	}
 
 	client.vm = vm
+	storeVMState(vm, io.Tokens)
+	proxy.storeState()
 
 	if proxyKSM != nil {
 		proxyKSM.kick()
@@ -323,9 +554,7 @@ func unregisterVM(data []byte, userData interface{}, response *handlerResponse) 
 
 	client.log.Info("UnregisterVM()")
 
-	proxy.Lock()
-	delete(proxy.vms, vm.containerID)
-	proxy.Unlock()
+	delVMAndState(proxy, vm)
 
 	client.vm = nil
 }
@@ -617,12 +846,13 @@ func (proxy *proxy) init() error {
 	var l net.Listener
 	var err error
 
-	// flags
-	proxy.enableVMConsole = logrus.GetLevel() == logrus.DebugLevel
+	if !proxy.restoreState() {
+		// flags
+		proxy.enableVMConsole = logrus.GetLevel() == logrus.DebugLevel
 
-	// Open the proxy socket
-	if proxy.socketPath, err = getSocketPath(); err != nil {
-		return fmt.Errorf("couldn't get a rigth socket path: %v", err)
+		if proxy.socketPath, err = getSocketPath(); err != nil {
+			return fmt.Errorf("couldn't get a rigth socket path: %v", err)
+		}
 	}
 	fds := listenFds()
 
