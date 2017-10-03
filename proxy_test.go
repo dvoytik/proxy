@@ -932,27 +932,28 @@ func TestGetSocketPath(t *testing.T) {
 }
 
 func TestStoreRestore(t *testing.T) {
+	assert := assert.New(t)
 	storeStateDir = "/tmp/clearcontainers/proxy/"
 	rig := newTestRig(t)
 	rig.Start()
 
 	// clean up a possible state
 	os.RemoveAll(storeStateDir)
-	assert.Equal(t, rig.proxy.restoreState(), false)
+	assert.Equal(rig.proxy.restoreState(), false)
 
 	rig.RegisterVM()
 	rig.Stop()
 	// the state must be present on the disk
 	files, err := ioutil.ReadDir(storeStateDir)
-	assert.Nil(t, err)
-	assert.Equal(t, len(files), 2)
-	assert.Equal(t, files[0].Name(), "proxy_state.json")
+	assert.Nil(err)
+	assert.Equal(len(files), 2)
+	assert.Equal(files[0].Name(), "proxy_state.json")
 
 	rig.Start()
-	assert.Equal(t, rig.proxy.restoreState(), true)
-	assert.Nil(t, rig.Client.UnregisterVM(testContainerID))
+	assert.Equal(rig.proxy.restoreState(), true)
+	assert.Nil(rig.Client.UnregisterVM(testContainerID))
 	// the state must be absent on the disk
 	files, err = ioutil.ReadDir(storeStateDir)
-	assert.Nil(t, err)
-	assert.Equal(t, len(files), 0)
+	assert.Nil(err)
+	assert.Equal(len(files), 0)
 }

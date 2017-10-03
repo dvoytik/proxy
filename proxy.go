@@ -37,6 +37,13 @@ import (
 	"github.com/clearcontainers/proxy/api"
 )
 
+// storeStateDir is populated at link time with the value of:
+//   $(LOCALSTATEDIR)/lib/clear-containers/proxy/"
+var storeStateDir string
+
+const proxyStateDirPerm = 0755
+const proxyStateFilesPerm = 0640
+
 // tokenState  tracks if an I/O token has been claimed by a shim.
 type tokenState int
 
@@ -83,6 +90,19 @@ type proxy struct {
 	enableVMConsole bool
 
 	wg sync.WaitGroup
+}
+
+type proxyStateOnDisk struct {
+	Version         string   `json:"version"`
+	SocketPath      string   `json:"socket_path"`
+	EnableVMConsole bool     `json:"enable_vm_console"`
+	ContainerIDs    []string `json:"container_ids"`
+}
+
+// Represents vm struct on disk
+type vmStateOnDisk struct {
+	RegisterVM api.RegisterVM `json:"registerVM"`
+	Tokens     []string       `json:"tokens"`
 }
 
 type clientKind int
@@ -133,6 +153,9 @@ func newClient(proxy *proxy, conn net.Conn) *client {
 func (proxy *proxy) restoreTokens(vm *vm, tokens []string) error {
 	if len(tokens) == 0 {
 		return nil
+	}
+	if vm == nil {
+		return fmt.Errorf("vm parameter must be not nil")
 	}
 
 	for _, token := range tokens {
@@ -221,25 +244,15 @@ func (proxy *proxy) releaseToken(token Token) (*tokenInfo, error) {
 	return info, nil
 }
 
-var storeStateDir = "/var/lib/clear-containers/proxy/"
-
-type proxyStateOnDisk struct {
-	SocketPath      string   `json:"socket_path"`
-	EnableVMConsole bool     `json:"enable_vm_console"`
-	ContainerIDs    []string `json:"container_ids"`
-}
-
 // returns false if it's a clean start (i.e. no state is stored) or restoring failed
 func (proxy *proxy) restoreState() bool {
 	proxyStateFilePath := storeStateDir + "proxy_state.json"
 	if _, err := os.Stat(storeStateDir); os.IsNotExist(err) {
-		if err := os.MkdirAll(storeStateDir, 0755); err != nil {
+		err := os.MkdirAll(storeStateDir, proxyStateDirPerm)
+		if err != nil {
 			proxyLog.Errorf("Couldn't create directory %s: %v",
 				storeStateDir, err)
 		}
-		return false
-	}
-	if _, err := os.Stat(proxyStateFilePath); os.IsNotExist(err) {
 		return false
 	}
 
@@ -261,6 +274,12 @@ func (proxy *proxy) restoreState() bool {
 		return false
 	}
 	proxyLog.Warn("Recovering proxy state from: ", proxyStateFilePath)
+	if proxyState.Version != Version {
+		proxyLog.Warnf("Stored state version (%s) mismatches proxy"+
+			" version (%s). Aborting", proxyState.Version, Version)
+		return false
+	}
+
 	proxy.socketPath = proxyState.SocketPath
 	proxy.enableVMConsole = proxyState.EnableVMConsole
 
@@ -285,6 +304,7 @@ func (proxy *proxy) storeState() {
 	}
 
 	proxyState := &proxyStateOnDisk{
+		Version:         Version,
 		SocketPath:      proxy.socketPath,
 		EnableVMConsole: proxy.enableVMConsole,
 		ContainerIDs:    make([]string, 0, len(proxy.vms)),
@@ -297,16 +317,11 @@ func (proxy *proxy) storeState() {
 	if err != nil {
 		proxyLog.Errorf("Couldn't marshal proxy state %+v", proxyState)
 	}
-	if err = ioutil.WriteFile(proxyStateFilePath, data, 0644); err != nil {
+	err = ioutil.WriteFile(proxyStateFilePath, data, proxyStateFilesPerm)
+	if err != nil {
 		proxyLog.Errorf("Couldn't store proxy state to %s: %v",
 			proxyStateFilePath, err)
 	}
-}
-
-// Represents vm struct on disk
-type vmStateOnDisk struct {
-	RegisterVM api.RegisterVM `json:"registerVM"`
-	Tokens     []string       `json:"tokens"`
 }
 
 func vmStateFilePath(id string) string {
@@ -325,16 +340,27 @@ func storeVMState(vm *vm, tokens []string) {
 	}
 	o, err := json.MarshalIndent(&odVM, "", "\t")
 	if err != nil {
-		proxyLog.WithField("vm", vm.containerID).Warn("Couldn't marshal VM state")
+		proxyLog.WithField("vm", vm.containerID).Warnf(
+			"Couldn't marshal VM state: %v", err)
+		return
 	}
 	storeFile := vmStateFilePath(vm.containerID)
-	if err = ioutil.WriteFile(storeFile, o, 0644); err != nil {
-		proxyLog.WithField("vm", vm.containerID).Warn("Couldn't store VM state to ",
-			storeFile)
+	err = ioutil.WriteFile(storeFile, o, proxyStateFilesPerm)
+	if err != nil {
+		proxyLog.WithField("vm", vm.containerID).Warnf(
+			"Couldn't store VM state to %s: %v", storeFile, err)
 	}
 }
 
 func delVMAndState(proxy *proxy, vm *vm) {
+	if proxy == nil {
+		proxyLog.Error("proxy parameter must be not nil")
+		return
+	}
+	if vm == nil {
+		proxyLog.Error("vm parameter must be not nil")
+		return
+	}
 	proxyLog.Infof("Removing on-disk state of %s", vm.containerID)
 	proxy.Lock()
 	delete(proxy.vms, vm.containerID)
@@ -342,8 +368,8 @@ func delVMAndState(proxy *proxy, vm *vm) {
 	proxy.storeState()
 	storeFile := vmStateFilePath(vm.containerID)
 	if err := os.Remove(storeFile); err != nil {
-		proxyLog.WithField("vm", vm.containerID).Warn("Couldn't remove file ",
-			storeFile)
+		proxyLog.WithField("vm", vm.containerID).Warnf(
+			"Couldn't remove file %s: %v", storeFile, err)
 	}
 }
 
@@ -851,7 +877,7 @@ func (proxy *proxy) init() error {
 		proxy.enableVMConsole = logrus.GetLevel() == logrus.DebugLevel
 
 		if proxy.socketPath, err = getSocketPath(); err != nil {
-			return fmt.Errorf("couldn't get a rigth socket path: %v", err)
+			return fmt.Errorf("couldn't get a right socket path: %v", err)
 		}
 	}
 	fds := listenFds()
