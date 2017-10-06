@@ -613,7 +613,8 @@ func (vm *vm) AllocateToken() (Token, error) {
 	return vm.AllocateTokenAs("")
 }
 
-// if token == "" then a new token is generate, otherwise provided token is reused
+// If token == "" then a new token is generated, otherwise the provided token
+// is reused.
 func (vm *vm) AllocateTokenAs(token Token) (Token, error) {
 	vm.Lock()
 	defer vm.Unlock()
