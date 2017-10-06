@@ -157,6 +157,9 @@ func (proxy *proxy) restoreTokens(vm *vm, tokens []string) error {
 	}
 
 	for _, token := range tokens {
+		if token == "" {
+			continue
+		}
 		token, err := vm.AllocateTokenAs(Token(token))
 		if err != nil {
 			return err
