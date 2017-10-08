@@ -247,8 +247,15 @@ func registerVM(data []byte, userData interface{}, response *handlerResponse) {
 	}
 
 	client.vm = vm
-	storeVMState(vm, io.Tokens)
-	proxy.storeState()
+
+	if err := storeVMState(vm, io.Tokens); err != nil {
+		logContID(vm.containerID).Errorf(
+			"Couldn't store VM state: %v", err)
+	}
+	if err := proxy.storeState(); err != nil {
+		proxyLog.Errorf("Couldn't store proxy's state: %v",
+			err)
+	}
 
 	if proxyKSM != nil {
 		proxyKSM.kick()
@@ -325,7 +332,10 @@ func unregisterVM(data []byte, userData interface{}, response *handlerResponse) 
 
 	client.log.Info("UnregisterVM()")
 
-	delVMAndState(proxy, vm)
+	if err := delVMAndState(proxy, vm); err != nil {
+		logContID(payload.ContainerID).Warnf("Error deleting state: %v",
+			err)
+	}
 
 	client.vm = nil
 }

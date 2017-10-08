@@ -1,4 +1,4 @@
-// Copyright (c) 2017 Intel Corporation
+// Copyright (c) 2017 Dmitry Voytik <voytikd@gmail.com>
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,10 +16,13 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
-	"github.com/clearcontainers/proxy/api"
 	"io/ioutil"
 	"os"
+
+	"github.com/Sirupsen/logrus"
+	"github.com/clearcontainers/proxy/api"
 )
 
 // storeStateDir is populated at link time with the value of:
@@ -30,29 +33,40 @@ const proxyStateFileName = "proxy_state.json"
 const proxyStateDirPerm = 0755
 const proxyStateFilesPerm = 0640
 
-// proxyStateOnDisk is used to (re)store proxy state on disk
+// state files format
+const stateFormatVersion = 1
+
+// proxyStateOnDisk is used to (re)store proxy state on disk.
+// XXX stateFormatVersion must be update in case of any changes in this struct.
 type proxyStateOnDisk struct {
-	Version         string   `json:"version"`
+	Version         uint     `json:"version"`
 	SocketPath      string   `json:"socket_path"`
 	EnableVMConsole bool     `json:"enable_vm_console"`
 	ContainerIDs    []string `json:"container_ids"`
 }
 
 // vmStateOnDisk is used to (re)store vm struct on disk
+// XXX stateFormatVersion must be update in case of any changes in this struct.
 type vmStateOnDisk struct {
 	RegisterVM api.RegisterVM `json:"registerVM"`
 	Tokens     []string       `json:"tokens"`
 }
 
+func logContID(containerID string) *logrus.Entry {
+	return proxyLog.WithField("container", containerID)
+}
+
+// On success returns nil, otherwise an error string message.
 func (proxy *proxy) restoreTokens(vm *vm, tokens []string) error {
 	if vm == nil {
-		return fmt.Errorf("vm parameter must be not nil")
+		return fmt.Errorf("vm parameter is nil")
 	}
 
 	for _, token := range tokens {
 		if token == "" {
 			continue
 		}
+
 		token, err := vm.AllocateTokenAs(Token(token))
 		if err != nil {
 			return err
@@ -76,7 +90,8 @@ func (proxy *proxy) restoreTokens(vm *vm, tokens []string) error {
 	return nil
 }
 
-// returns false if it's a clean start (i.e. no state is stored) or restoring failed
+// returns false if it's a clean start (i.e. no state is stored) or restoring
+// failed
 func (proxy *proxy) restoreState() bool {
 	proxyStateFilePath := storeStateDir + proxyStateFileName
 	if _, err := os.Stat(storeStateDir); os.IsNotExist(err) {
@@ -90,54 +105,66 @@ func (proxy *proxy) restoreState() bool {
 
 	fdata, err := ioutil.ReadFile(proxyStateFilePath)
 	if err != nil {
-		proxyLog.Errorf("Couldn't read state file %s: %v", proxyStateFilePath, err)
+		proxyLog.Errorf("Couldn't read state file %s: %v",
+			proxyStateFilePath, err)
 		return false
 	}
 
 	var proxyState proxyStateOnDisk
 	err = json.Unmarshal(fdata, &proxyState)
 	if err != nil {
-		proxyLog.Errorf("Couldn't unmarshal %s: %v", proxyStateFilePath, err)
+		proxyLog.Errorf("Couldn't unmarshal %s: %v",
+			proxyStateFilePath, err)
 		return false
 	}
-	proxyLog.Debugf("proxy: %+v", proxyState)
+
+	proxyLog.Debugf("proxyState: %+v", proxyState)
 
 	if len(proxyState.ContainerIDs) == 0 {
+		proxyLog.Warnf("ContainerIDs list is empty")
 		return false
 	}
-	proxyLog.Warn("Recovering proxy state from: ", proxyStateFilePath)
-	if proxyState.Version != Version {
-		proxyLog.Warnf("Stored state version (%s) mismatches proxy"+
-			" version (%s). Aborting", proxyState.Version, Version)
+
+	proxyLog.Info("Recovering proxy state from: ", proxyStateFilePath)
+	if proxyState.Version > stateFormatVersion {
+		proxyLog.Errorf("Stored state format version (%d) is higher "+
+			"than supported (%d). Aborting", proxyState.Version,
+			stateFormatVersion)
 		return false
 	}
 
 	proxy.socketPath = proxyState.SocketPath
 	proxy.enableVMConsole = proxyState.EnableVMConsole
 
-	for _, contID := range proxyState.ContainerIDs {
-		go restoreVMState(proxy, contID)
+	for _, containerID := range proxyState.ContainerIDs {
+		go func(contID string) {
+			// ignore failures here but log them inside
+			_ = restoreVMState(proxy, contID)
+		}(containerID)
 	}
 
 	return true
 }
 
-func (proxy *proxy) storeState() {
+// On success returns nil, otherwise an error string message.
+func (proxy *proxy) storeState() error {
 	proxyStateFilePath := storeStateDir + proxyStateFileName
 	proxy.Lock()
 	defer proxy.Unlock()
 
 	// if there are 0 VMs then remove state from disk
 	if (len(proxy.vms)) == 0 {
+		if _, err := os.Stat(proxyStateFilePath); os.IsNotExist(err) {
+			return nil
+		}
 		if err := os.Remove(proxyStateFilePath); err != nil {
-			proxyLog.Errorf("Couldn't remove %s: %v",
+			return fmt.Errorf("Couldn't remove file %s: %v",
 				proxyStateFilePath, err)
 		}
-		return
 	}
 
 	proxyState := &proxyStateOnDisk{
-		Version:         Version,
+		Version:         stateFormatVersion,
 		SocketPath:      proxy.socketPath,
 		EnableVMConsole: proxy.enableVMConsole,
 		ContainerIDs:    make([]string, 0, len(proxy.vms)),
@@ -149,23 +176,25 @@ func (proxy *proxy) storeState() {
 
 	data, err := json.MarshalIndent(proxyState, "", "\t")
 	if err != nil {
-		proxyLog.Errorf("Couldn't marshal proxy state %+v: %v",
+		return fmt.Errorf("Couldn't marshal proxy state %+v: %v",
 			proxyState, err)
 	}
 
 	err = ioutil.WriteFile(proxyStateFilePath, data, proxyStateFilesPerm)
 	if err != nil {
-		proxyLog.Errorf("Couldn't store proxy state to %s: %v",
+		return fmt.Errorf("Couldn't store proxy state to file %s: %v",
 			proxyStateFilePath, err)
 	}
+	return nil
 }
 
 func vmStateFilePath(id string) string {
 	return storeStateDir + "vm_" + id + ".json"
 }
 
-func storeVMState(vm *vm, tokens []string) {
-	odVM := vmStateOnDisk{
+// On success returns nil, otherwise an error string message.
+func storeVMState(vm *vm, tokens []string) error {
+	stVM := vmStateOnDisk{
 		RegisterVM: api.RegisterVM{
 			ContainerID: vm.containerID,
 			CtlSerial:   vm.hyperHandler.GetCtlSockPath(),
@@ -174,130 +203,163 @@ func storeVMState(vm *vm, tokens []string) {
 		},
 		Tokens: tokens,
 	}
-	o, err := json.MarshalIndent(&odVM, "", "\t")
+
+	o, err := json.MarshalIndent(&stVM, "", "\t")
 	if err != nil {
-		proxyLog.WithField("vm", vm.containerID).Warnf(
-			"Couldn't marshal VM state: %v", err)
-		return
+		return fmt.Errorf("Couldn't marshal VM state: %v", err)
 	}
 
 	storeFile := vmStateFilePath(vm.containerID)
 
 	err = ioutil.WriteFile(storeFile, o, proxyStateFilesPerm)
 	if err != nil {
-		proxyLog.WithField("vm", vm.containerID).Warnf(
-			"Couldn't store VM state to %s: %v", storeFile, err)
+		return fmt.Errorf("Couldn't store VM state to %s: %v",
+			storeFile, err)
 	}
+
+	return nil
 }
 
-func delVMAndState(proxy *proxy, vm *vm) {
+// On success returns nil, otherwise an error string message.
+func delVMAndState(proxy *proxy, vm *vm) error {
 	if proxy == nil {
-		proxyLog.Error("proxy parameter must be not nil")
-		return
+		return errors.New("proxy parameter is nil")
 	}
 	if vm == nil {
-		proxyLog.Error("vm parameter must be not nil")
-		return
+		return errors.New("vm parameter is nil")
 	}
 
-	proxyLog.Infof("Removing on-disk state of %s", vm.containerID)
+	logContID(vm.containerID).Infof("Removing on-disk state")
 
 	proxy.Lock()
 	delete(proxy.vms, vm.containerID)
 	proxy.Unlock()
 
-	proxy.storeState()
+	if err := proxy.storeState(); err != nil {
+		logContID(vm.containerID).Warnf("Couldn't store proxy's state:"+
+			" %v", err)
+	}
+
 	storeFile := vmStateFilePath(vm.containerID)
 	if err := os.Remove(storeFile); err != nil {
-		proxyLog.WithField("vm", vm.containerID).Warnf(
-			"Couldn't remove file %s: %v", storeFile, err)
+		return fmt.Errorf("Couldn't remove file %s: %v", storeFile, err)
 	}
+	return nil
 }
 
-func readVMState(containerID string) *vmStateOnDisk {
+func readVMState(containerID string) (*vmStateOnDisk, error) {
 	if containerID == "" {
-		proxyLog.Errorf("containerID parameter must be not empty")
-		return nil
+		return nil, fmt.Errorf("containerID parameter is empty")
 	}
 
 	vmStateFilePath := vmStateFilePath(containerID)
 	fdata, err := ioutil.ReadFile(vmStateFilePath)
 	if err != nil {
-		proxyLog.Errorf("Couldn't read %s: %v", vmStateFilePath, err)
-		return nil
+		return nil, fmt.Errorf("Couldn't read %s: %v", vmStateFilePath,
+			err)
 	}
 
 	var vmState vmStateOnDisk
 	err = json.Unmarshal(fdata, &vmState)
 	if err != nil {
-		proxyLog.Errorf("Couldn't unmarshal %s: %v", vmStateFilePath, err)
-		return nil
+		return nil, fmt.Errorf("Couldn't unmarshal %s: %v",
+			vmStateFilePath, err)
 	}
 
-	proxyLog.Debugf("restoring vm state: %+v", vmState)
-	return &vmState
+	return &vmState, nil
 }
 
-func restoreTokens(proxy *proxy, vmState *vmStateOnDisk, vm *vm) {
+func restoreTokens(proxy *proxy, vmState *vmStateOnDisk, vm *vm) error {
 	if err := proxy.restoreTokens(vm, vmState.Tokens); err != nil {
-		proxyLog.Errorf("Failed to restore tokens: %v", err)
-		return
+		return fmt.Errorf("Failed to restore tokens %+v: %v",
+			vmState.Tokens, err)
 	}
 
 	for _, token := range vmState.Tokens {
+		if token == "" {
+			return fmt.Errorf("Empty token in recovering state")
+		}
+
 		session := vm.findSessionByToken(Token(token))
 		if session == nil {
-			proxyLog.Errorf("Session must be not nil")
-			delVMAndState(proxy, vm)
-			return
+			_ = delVMAndState(proxy, vm) // errors are irrelevant here
+			return fmt.Errorf("Couldn't find a session for token: %s",
+				token)
 		}
+
 		if err := session.WaitForShim(); err != nil {
-			proxyLog.Errorf("Failed to re-connect with shim: %v", err)
-			delVMAndState(proxy, vm)
-			return
+			_ = delVMAndState(proxy, vm) // errors are irrelevant here
+			return fmt.Errorf("Failed to re-connect with shim "+
+				"(token = %s): %v", token, err)
 		}
 	}
+	return nil
 }
 
-func restoreVMState(proxy *proxy, containerID string) {
+func restoreVMState(proxy *proxy, containerID string) bool {
 	if proxy == nil {
-		proxyLog.Errorf("proxy parameter must be not nil")
-		return
+		logContID(containerID).Errorf("proxy parameter is nil")
+		return false
 	}
 
-	vmState := readVMState(containerID)
-	if vmState == nil {
-		return
+	if containerID == "" {
+		logContID(containerID).Errorf("containerID is empty. Ignoring.")
+		return false
 	}
+
+	vmState, err := readVMState(containerID)
+	if err != nil {
+		logContID(containerID).Error(err)
+		return false
+	}
+	logContID(containerID).Debugf("restoring vm state: %+v", vmState)
 
 	regVM := vmState.RegisterVM
-	if regVM.ContainerID == "" || regVM.CtlSerial == "" || regVM.IoSerial == "" {
-		proxyLog.Errorf("wrong VM parameters")
-		return
+	if regVM.ContainerID == "" || regVM.CtlSerial == "" ||
+		regVM.IoSerial == "" {
+		logContID(containerID).Errorf("wrong VM parameters")
+		return false
+	}
+
+	if regVM.ContainerID != containerID {
+		logContID(containerID).Errorf("Inconsistent container ID: %s",
+			regVM.ContainerID)
+		return false
 	}
 
 	proxy.Lock()
 	if _, ok := proxy.vms[regVM.ContainerID]; ok {
 		proxy.Unlock()
-		proxyLog.Errorf("%s: container already registered", regVM.ContainerID)
-		return
+		logContID(containerID).Errorf("container already registered")
+		return false
 	}
 	vm := newVM(regVM.ContainerID, regVM.CtlSerial, regVM.IoSerial)
 	proxy.vms[regVM.ContainerID] = vm
 	proxy.Unlock()
 
-	proxyLog.Infof("restoreVMState(containerId=%s,ctlSerial=%s,ioSerial=%s,console=%s)",
-		regVM.ContainerID, regVM.CtlSerial, regVM.IoSerial, regVM.Console)
+	proxyLog.WithFields(logrus.Fields{
+		"container":       regVM.ContainerID,
+		"control-channel": regVM.CtlSerial,
+		"io-channel":      regVM.IoSerial,
+		"console":         regVM.Console,
+	}).Info("restoring state")
 
 	if regVM.Console != "" && proxy.enableVMConsole {
 		vm.setConsole(regVM.Console)
 	}
 
-	restoreTokens(proxy, vmState, vm)
+	if err := restoreTokens(proxy, vmState, vm); err != nil {
+		logContID(containerID).Errorf("Error restoring tokens: %v", err)
+		return false
+	}
+
 	if err := vm.Reconnect(true); err != nil {
-		proxyLog.Errorf("Failed to connect: %v", err)
-		delVMAndState(proxy, vm)
-		return
+		logContID(containerID).Errorf("Failed to connect: %v", err)
+		if err := delVMAndState(proxy, vm); err != nil {
+			logContID(containerID).Errorf("Failed to delete vm's "+
+				"state: %v", err)
+		}
+		return false
 	}
 
 	// We start one goroutine per-VM to monitor the qemu process
@@ -307,4 +369,6 @@ func restoreVMState(proxy *proxy, containerID string) {
 		vm.Close()
 		proxy.wg.Done()
 	}()
+
+	return true
 }
